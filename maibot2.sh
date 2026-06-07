@@ -178,6 +178,49 @@ start_bot() {
 }
 
 # =============================================
+# 读取 WebUI 端口
+# =============================================
+_get_webui_port() {
+    local port=""
+    # 尝试从 bot_config.toml [webui] 段读取 port
+    if [ -f "$BOT_DIR/config/bot_config.toml" ]; then
+        # 匹配 [webui] 段下的 port = xxxx
+        port=$(awk '/^\[webui\]/{found=1; next} /^\[/{found=0} found && /^\s*port\s*=/{gsub(/[^0-9]/,""); print; exit}' "$BOT_DIR/config/bot_config.toml" 2>/dev/null)
+    fi
+    echo "${port:-8001}"
+}
+
+# =============================================
+# 读取 WebUI Access Token
+# =============================================
+_get_access_token() {
+    local token=""
+    if [ -f "$BOT_DIR/data/webui.json" ] && command -v python3 &>/dev/null; then
+        token=$("$PYTHON_BIN" -c "import json; print(json.load(open('$BOT_DIR/data/webui.json')).get('access_token',''))" 2>/dev/null)
+    fi
+    echo "$token"
+}
+
+# =============================================
+# 查找 Worker 进程 PID（带 MAIBOT_WORKER_PROCESS=1 环境变量）
+# =============================================
+_find_worker_pid() {
+    local pids; pids=$(_scan_pids)
+    for p in $pids; do
+        # Linux: 通过 /proc/PID/environ 检查
+        if [ -f "/proc/$p/environ" ]; then
+            if tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -q "MAIBOT_WORKER_PROCESS=1"; then
+                echo "$p"
+                return 0
+            fi
+        fi
+    done
+    # 无法区分时返回空
+    echo ""
+    return 1
+}
+
+# =============================================
 # 停止 MaiBot
 # =============================================
 stop_bot() {
@@ -187,29 +230,61 @@ stop_bot() {
         return 1
     fi
 
-    local pid; pid=$(get_pid)
-    info "正在停止 MaiBot..."
+    local webui_port; webui_port=$(_get_webui_port)
+    local access_token; access_token=$(_get_access_token)
+    local worker_pid; worker_pid=$(_find_worker_pid)
 
-    # 杀掉所有 bot.py 进程（包括 PID 文件记录的和扫描到的）
-    if command -v pkill &>/dev/null; then
-        pkill -f "bot\.py" 2>/dev/null
-    else
-        ps aux 2>/dev/null | grep -iE 'python.*bot\.py' | grep -v grep | awk '{print $1}' | while read -r p; do
-            kill "$p" 2>/dev/null
+    # ---- 方法1: 通过 WebUI API 触发优雅关闭（推荐）----
+    if [ -n "$access_token" ] && [ -n "$webui_port" ]; then
+        info "通过 WebUI API 触发优雅关闭..."
+
+        # 调用 /system/restart，内部会依次：
+        #   触发 ON_STOP 事件 → 停止插件运行时 → 取消异步任务 → os._exit(42)
+        curl -s -X POST "http://127.0.0.1:${webui_port}/api/webui/system/restart" \
+             -H "Cookie: maibot_session=${access_token}" \
+             --max-time 5 2>/dev/null && {
+            info "API 请求已发送，Worker 正在执行优雅清理..."
+        } || warn "WebUI API 请求失败，将尝试信号方式"
+
+        # 立即杀掉 Runner 进程（防止它在 Worker 退出码=42 时重启 Worker）
+        # Runner 是没有 MAIBOT_WORKER_PROCESS 的 bot.py 进程
+        local runner_killed=0
+        for p in $(_scan_pids); do
+            if [ -n "$worker_pid" ] && [ "$p" = "$worker_pid" ]; then
+                continue  # 跳过 Worker
+            fi
+            kill "$p" 2>/dev/null && runner_killed=1
         done
+        [ "$runner_killed" = "1" ] && info "已终止 Runner 进程（防止自动重启）"
+    else
+        warn "无法获取 WebUI Token 或端口，跳过 API 方式"
     fi
 
-    # 也杀脚本记录的 bash wrapper PID
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+    # ---- 方法2: 直接向 Worker 发送 SIGINT（兜底）----
+    if is_running; then
+        if [ -n "$worker_pid" ]; then
+            info "向 Worker 进程发送 SIGINT..."
+            kill -INT "$worker_pid" 2>/dev/null
+        else
+            # 无法识别 Worker，对所有 bot.py 发 SIGINT
+            info "发送 SIGINT 到所有 bot.py 进程..."
+            if command -v pkill &>/dev/null; then
+                pkill -INT -f "bot\.py" 2>/dev/null
+            fi
+        fi
+    fi
 
-    # 等待 10s 优雅退出
+    # ---- 等待优雅退出 (30s) ----
     local count=0
-    while is_running && [ $count -lt 10 ]; do
+    while is_running && [ $count -lt 30 ]; do
         sleep 1
         count=$((count + 1))
+        if [ $((count % 5)) -eq 0 ]; then
+            info "等待 MaiBot 退出... (${count}s/30s)"
+        fi
     done
 
-    # 还没死就强制 kill -9
+    # ---- 超时后强制 kill -9（最后兜底）----
     if is_running; then
         warn "优雅停止超时，强制终止..."
         if command -v pkill &>/dev/null; then
@@ -219,8 +294,15 @@ stop_bot() {
                 kill -9 "$p" 2>/dev/null
             done
         fi
-        [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
         sleep 2
+    fi
+
+    # ---- 清理 bash wrapper（nohup 启动时的 bash 层）----
+    local saved_pid; saved_pid=$(get_pid)
+    if [ -n "$saved_pid" ]; then
+        kill -0 "$saved_pid" 2>/dev/null && kill "$saved_pid" 2>/dev/null
+        sleep 1
+        kill -0 "$saved_pid" 2>/dev/null && kill -9 "$saved_pid" 2>/dev/null
     fi
 
     if ! is_running; then
