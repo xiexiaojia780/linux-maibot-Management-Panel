@@ -26,6 +26,10 @@ success() { echo -e "${GREEN}[OK]${NC} $1"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 
+print_line() {
+    echo -e "${CYAN}========================================================${NC}"
+}
+
 # ---------- 错误处理 ----------
 _NEED_PAUSE=1
 handle_exit() {
@@ -92,8 +96,269 @@ auto_detect() {
 auto_detect
 
 # =============================================
-# PID 进程管理
+# 确保 uv 可用（首次运行自动安装）
 # =============================================
+ensure_uv() {
+    if command -v uv &>/dev/null; then
+        return 0
+    fi
+
+    warn "未检测到 uv 包管理器，正在自动安装..."
+    info "uv 可以解决 pip 在部分环境下安装失败的问题"
+
+    if command -v curl &>/dev/null; then
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+    elif command -v wget &>/dev/null; then
+        wget -qO- https://astral.sh/uv/install.sh | sh
+    else
+        error "curl 和 wget 均不可用，无法自动安装 uv"
+        info "请手动安装: curl -LsSf https://astral.sh/uv/install.sh | sh"
+        return 1
+    fi
+
+    # 刷新 PATH（uv 安装到 ~/.local/bin 或 ~/.cargo/bin）
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+
+    if command -v uv &>/dev/null; then
+        success "uv 安装成功: $(uv --version 2>/dev/null)"
+        return 0
+    else
+        warn "uv 已安装但未在 PATH 中找到，请重新打开终端后重试"
+        return 1
+    fi
+}
+
+ensure_uv
+
+# =============================================
+# 确保 MaiBot 项目存在
+# =============================================
+MAIBOT_REPO="https://github.com/Mai-with-u/MaiBot.git"
+
+_verify_maibot_dir() {
+    local dir="$1"
+    [ -d "$dir" ] && [ -f "$dir/bot.py" ] && return 0
+    return 1
+}
+
+_migrate_script_to() {
+    local target_dir="$1"
+    local script_name; script_name=$(basename "$0")
+    local src="$SCRIPT_DIR/$script_name"
+    local dst="$target_dir/$script_name"
+
+    if [ "$src" = "$dst" ]; then
+        info "脚本已在目标目录，无需迁移"
+        return 0
+    fi
+
+    info "正在将脚本迁移到 $target_dir ..."
+    cp "$src" "$dst" && chmod +x "$dst" || {
+        error "脚本迁移失败"
+        return 1
+    }
+    success "脚本已复制到 $dst"
+    warn "脚本位置已变更，下次请运行: $dst"
+    echo ""
+    read -r -p "按回车退出（请重新运行新位置的脚本）..."
+    exit 0
+}
+
+_suggest_maibot_path() {
+    # 常见的 MaiBot 可能位置
+    local guesses=(
+        "$SCRIPT_DIR/MaiBot"
+        "$SCRIPT_DIR/../MaiBot"
+        "$HOME/MaiBot"
+        "/opt/MaiBot"
+        "/home/$USER/MaiBot"
+    )
+    local found=""
+    for g in "${guesses[@]}"; do
+        if _verify_maibot_dir "$g"; then
+            found="$g"
+            break
+        fi
+    done
+    echo "$found"
+}
+
+install_maibot() {
+    echo ""
+    print_line
+    echo -e "${BOLD}${MAGENTA}安装 MaiBot${RESET}"
+    print_line
+    echo ""
+
+    # 选择 GitHub 代理
+    echo -e "${CYAN}请选择 GitHub 下载代理:${RESET}"
+    echo -e "  ${GREEN}[1]${RESET} ghfast.top 镜像 (推荐)"
+    echo -e "  ${GREEN}[2]${RESET} gh.llkk.cc 镜像"
+    echo -e "  ${GREEN}[3]${RESET} 不使用代理（直连 GitHub）"
+    echo -e "  ${GREEN}[4]${RESET} 自定义代理"
+    echo ""
+    echo -ne "${BOLD}${YELLOW}请选择 [1-4]: ${RESET}"
+    read -r proxy_choice
+    local proxy=""
+    case $proxy_choice in
+        1) proxy="https://ghfast.top/" ;;
+        2) proxy="https://gh.llkk.cc/" ;;
+        3) proxy="" ;;
+        4)
+            read -r -p "请输入自定义代理 URL (以 / 结尾): " proxy
+            [[ -n "$proxy" && "$proxy" != */ ]] && proxy="${proxy}/"
+            ;;
+        *) proxy="https://ghfast.top/" ;;
+    esac
+
+    # 选择安装位置
+    echo ""
+    local default_dir="$SCRIPT_DIR/MaiBot"
+    echo -e "${CYAN}直接回车 = 使用默认路径 | 输入新路径 = 安装到指定位置${RESET}"
+    echo -e "${BOLD}${YELLOW}安装目录 (默认: $default_dir): ${RESET}"
+    echo -ne "${CYAN}> ${RESET}"
+    read -r install_dir
+    install_dir="${install_dir:-$default_dir}"
+
+    echo -e "${BOLD}${YELLOW}确认安装到 $install_dir ? (Y/n): ${RESET}"
+    read -r confirm
+    case "${confirm:-y}" in
+        y|Y|yes|YES) info "继续安装..." ;;
+        *) info "已取消安装"; return ;;
+    esac
+
+    local parent_dir; parent_dir=$(dirname "$install_dir")
+    if [ ! -d "$parent_dir" ]; then
+        info "创建父目录: $parent_dir"
+        mkdir -p "$parent_dir" || { error "无法创建目录"; return 1; }
+    fi
+
+    if [ -d "$install_dir" ]; then
+        warn "目录已存在: $install_dir"
+        read -r -p "是否删除并重新克隆？(y/N): " del_choice
+        case "${del_choice:-n}" in
+            y|Y|yes|YES) rm -rf "$install_dir" ;;
+            *) info "跳过安装"; return ;;
+        esac
+    fi
+
+    # 克隆
+    local clone_url="${proxy}${MAIBOT_REPO}"
+    info "克隆仓库: $clone_url"
+    info "目标目录: $install_dir"
+
+    local attempt=1
+    while [[ $attempt -le 3 ]]; do
+        info "尝试 $attempt/3..."
+        if git clone --depth 1 "$clone_url" "$install_dir" 2>/dev/null; then
+            success "MaiBot 克隆成功"
+            break
+        else
+            warn "克隆失败,重试 $attempt/3"
+            ((attempt++))
+            sleep 5
+        fi
+    done
+
+    if [[ $attempt -gt 3 ]]; then
+        error "克隆失败，请检查网络或更换代理"
+        return 1
+    fi
+
+    # 安装依赖
+    echo ""
+    info "正在安装 MaiBot 依赖..."
+    cd "$install_dir" || { error "无法进入 $install_dir"; return 1; }
+
+    info "使用 uv sync 安装依赖..."
+    if uv sync -i https://pypi.tuna.tsinghua.edu.cn/simple 2>&1; then
+        success "MaiBot 依赖安装成功"
+    else
+        warn "依赖安装可能不完整，请稍后手动执行: cd $install_dir && uv sync"
+    fi
+
+    # 迁移脚本到 MaiBot 同级目录
+    _migrate_script_to "$parent_dir"
+}
+
+specify_maibot_path() {
+    echo ""
+    local guess; guess=$(_suggest_maibot_path)
+    if [ -n "$guess" ]; then
+        info "自动探测到可能的 MaiBot 位置: ${GREEN}$guess${RESET}"
+        echo -ne "${BOLD}${YELLOW}使用此路径? (Y/n): ${RESET}"
+        read -r use_guess
+        use_guess="${use_guess:-y}"
+        case "${use_guess:-y}" in
+            y|Y|yes|YES)
+                local parent; parent=$(dirname "$guess")
+                _migrate_script_to "$parent"
+                return
+                ;;
+        esac
+    fi
+
+    echo -ne "${BOLD}${YELLOW}请输入 MaiBot 所在目录的完整路径（包含 bot.py 的目录）: ${RESET}"
+    read -r user_path
+
+    if [ -z "$user_path" ]; then
+        warn "未输入路径，跳过"
+        return
+    fi
+
+    # 展开 ~
+    user_path="${user_path/#\~/$HOME}"
+
+    if ! _verify_maibot_dir "$user_path"; then
+        error "该目录不存在或不包含 bot.py: $user_path"
+        return
+    fi
+
+    success "检测到有效的 MaiBot: $user_path"
+    local parent; parent=$(dirname "$user_path")
+    _migrate_script_to "$parent"
+}
+
+ensure_maibot() {
+    # auto_detect 已经找到了
+    if [ -n "$BOT_DIR" ] && _verify_maibot_dir "$BOT_DIR"; then
+        info "MaiBot: ${GREEN}$BOT_DIR${RESET}"
+        return 0
+    fi
+
+    warn "未检测到 MaiBot 项目"
+
+    echo ""
+    echo -e "${CYAN}----------------------------------------${NC}"
+    echo -e "${BOLD}未找到 MaiBot，请选择:${NC}"
+    echo -e "${CYAN}----------------------------------------${NC}"
+    echo -e "  ${GREEN}[1]${RESET} 🚀 自动安装 MaiBot (从 GitHub 克隆)"
+    echo -e "  ${GREEN}[2]${RESET} 📁 手动指定 MaiBot 所在目录"
+    echo -e "  ${GREEN}[0]${RESET} ⏭️  跳过（仅管理已有实例，稍后配置）"
+    echo ""
+    echo -ne "${BOLD}${YELLOW}请选择 [0-2]: ${RESET}"
+
+    read -r choice
+    case $choice in
+        1)
+            install_maibot
+            ;;
+        2)
+            specify_maibot_path
+            ;;
+        0)
+            warn "跳过 MaiBot 检测，部分功能可能不可用"
+            ;;
+        *)
+            warn "无效选择，跳过"
+            ;;
+    esac
+}
+
+ensure_maibot
+# 重新探测（用户可能指定了新路径，或子目录安装后已就位）
+auto_detect
+
 # 扫描所有 bot.py 进程（不依赖 PID 文件）
 _scan_pids() {
     if command -v pgrep &>/dev/null; then
@@ -379,31 +644,19 @@ update_bot() {
         fi
     fi
 
-    info "激活虚拟环境"
-    source "$VENV_DIR/bin/activate"
-    info "开始安装依赖"
-    # 安装 MaiBot 依赖
-    attempt=1
-    while [[ $attempt -le 3 ]]; do
-        if [[ -f "requirements.txt" ]]; then
-            if pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --upgrade; then
-                success "MaiBot 依赖安装成功"
-                break
-            else
-                warn "MaiBot 依赖安装失败,重试 $attempt/3"
-                ((attempt++))
-                sleep 5
-            fi
-        else
-            error "未找到 requirements.txt 文件"
-            break
-        fi
-    done
-
-    if [[ $attempt -gt 3 ]]; then
-        error "MaiBot 依赖安装多次失败"
+    info "安装依赖 (uv sync)..."
+    cd "$BOT_DIR"
+    if uv sync -i https://pypi.tuna.tsinghua.edu.cn/simple 2>&1; then
+        success "MaiBot 依赖安装成功"
+    else
+        error "依赖安装失败，请手动执行: cd $BOT_DIR && uv sync"
     fi
-    deactivate
+
+    # 更新 VENV_DIR（uv sync 创建 .venv）
+    if [ -d "$BOT_DIR/.venv" ]; then
+        VENV_DIR="$BOT_DIR/.venv"
+        PYTHON_BIN="$VENV_DIR/bin/python3"
+    fi
     info "更新已结束"
     echo ""
     read -r -p "按回车返回菜单..."
