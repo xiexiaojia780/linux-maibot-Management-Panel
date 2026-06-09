@@ -131,6 +131,83 @@ ensure_uv() {
 ensure_uv
 
 # =============================================
+# 确保 curl 可用（首次运行自动安装）
+# =============================================
+ensure_curl() {
+    if command -v curl &>/dev/null; then
+        return 0
+    fi
+    if command -v wget &>/dev/null; then
+        info "已检测到 wget，跳过 curl 安装"
+        return 0
+    fi
+
+    warn "未检测到 curl 或 wget，正在自动安装 curl..."
+    info "curl 是下载脚本和依赖的必要工具"
+
+    if command -v apt &>/dev/null; then
+        sudo apt update -qq && sudo apt install curl -y -qq
+    elif command -v yum &>/dev/null; then
+        sudo yum install curl -y -q
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install curl -y -q
+    elif command -v pacman &>/dev/null; then
+        sudo pacman -S curl --noconfirm
+    else
+        error "无法识别包管理器，请手动安装 curl"
+        info "  Ubuntu/Debian: sudo apt install curl"
+        info "  CentOS/RHEL:   sudo yum install curl"
+        return 1
+    fi
+
+    if command -v curl &>/dev/null; then
+        success "curl 安装成功: $(curl --version 2>/dev/null | head -1)"
+        return 0
+    else
+        error "curl 安装失败，请手动安装后重试"
+        return 1
+    fi
+}
+
+ensure_curl
+
+# =============================================
+# 确保 git 可用（首次运行自动安装）
+# =============================================
+ensure_git() {
+    if command -v git &>/dev/null; then
+        return 0
+    fi
+
+    warn "未检测到 git，正在自动安装..."
+
+    if command -v apt &>/dev/null; then
+        sudo apt update -qq && sudo apt install git -y -qq
+    elif command -v yum &>/dev/null; then
+        sudo yum install git -y -q
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install git -y -q
+    elif command -v pacman &>/dev/null; then
+        sudo pacman -S git --noconfirm
+    else
+        error "无法识别包管理器，请手动安装 git"
+        info "  Ubuntu/Debian: sudo apt install git"
+        info "  CentOS/RHEL:   sudo yum install git"
+        return 1
+    fi
+
+    if command -v git &>/dev/null; then
+        success "git 安装成功: $(git --version 2>/dev/null)"
+        return 0
+    else
+        error "git 安装失败，请手动安装后重试"
+        return 1
+    fi
+}
+
+ensure_git
+
+# =============================================
 # 确保 MaiBot 项目存在
 # =============================================
 MAIBOT_REPO="https://github.com/Mai-with-u/MaiBot.git"
@@ -590,7 +667,8 @@ restart_bot() {
 }
 
 # =============================================
-# 更新 MaiBot（与原版 maibot.sh 完全一致）
+# =============================================
+# 更新 MaiBot
 # =============================================
 update_bot() {
     cd "$BOT_DIR" || { error "无法进入 $BOT_DIR"; return; }
@@ -599,6 +677,31 @@ update_bot() {
         error "不是 Git 仓库，无法更新"
         return
     fi
+
+    # ---- 选择 GitHub 代理 ----
+    local remote_url; remote_url=$(git remote get-url origin 2>/dev/null)
+    echo ""
+    echo -e "${CYAN}当前远程仓库: ${GREEN}${remote_url:-未知}${RESET}"
+    echo ""
+    echo -e "${CYAN}请选择 GitHub 下载代理:${RESET}"
+    echo -e "  ${GREEN}[1]${RESET} ghfast.top 镜像 (推荐)"
+    echo -e "  ${GREEN}[2]${RESET} gh.llkk.cc 镜像"
+    echo -e "  ${GREEN}[3]${RESET} 不使用代理（直连 GitHub）"
+    echo -e "  ${GREEN}[4]${RESET} 自定义代理"
+    echo ""
+    echo -ne "${BOLD}${YELLOW}请选择 [1-4]: ${RESET}"
+    read -r proxy_choice
+    local proxy=""
+    case $proxy_choice in
+        1) proxy="https://ghfast.top/" ;;
+        2) proxy="https://gh.llkk.cc/" ;;
+        3) proxy="" ;;
+        4)
+            read -r -p "请输入自定义代理 URL (以 / 结尾): " proxy
+            [[ -n "$proxy" && "$proxy" != */ ]] && proxy="${proxy}/"
+            ;;
+        *) proxy="https://ghfast.top/" ;;
+    esac
 
     info "正在备份data和config"
     if [ -d "../backup" ]; then
@@ -622,11 +725,22 @@ update_bot() {
     fi
 
     info "拉取远程仓库最新代码..."
-    if git pull --force; then
-        success "仓库已成功拉取"
+    if [ -n "$proxy" ]; then
+        info "使用代理: ${proxy}"
+        if git -c url."${proxy}".insteadOf=https://github.com/ pull --force --progress; then
+            success "仓库已成功拉取"
+        else
+            error "仓库拉取失败，请检查网络或更换代理后重试"
+            return
+        fi
     else
-        warn "仓库拉取失败"
-        return
+        info "直连 GitHub..."
+        if git pull --force --progress; then
+            success "仓库已成功拉取"
+        else
+            error "仓库拉取失败，请检查网络或尝试使用代理后重试"
+            return
+        fi
     fi
 
     # 如果有保存的stash，则尝试恢复
@@ -646,6 +760,13 @@ update_bot() {
 
     info "安装依赖 (uv sync)..."
     cd "$BOT_DIR"
+
+    # 删除旧的 uv.lock 避免版本不兼容导致解析失败
+    if [ -f "uv.lock" ]; then
+        info "清除旧的 uv.lock..."
+        rm -f uv.lock
+    fi
+
     if uv sync -i https://pypi.tuna.tsinghua.edu.cn/simple 2>&1; then
         success "MaiBot 依赖安装成功"
     else
@@ -753,6 +874,113 @@ clean_logs() {
 }
 
 # =============================================
+# 安装 NapCatQQ
+# =============================================
+NAPCAT_INSTALLER_URL="https://nclatest.znin.net/NapNeko/NapCat-Installer/main/script/install.sh"
+
+install_napcat() {
+    echo ""
+    print_line
+    echo -e "${BOLD}${MAGENTA}安装 NapCatQQ${RESET}"
+    print_line
+    echo ""
+
+    info "NapCatQQ 是基于无头 NTQQ 的 OneBot 协议实现，用于 MaiBot 连接 QQ"
+    info "安装位置: ${GREEN}$HOME${RESET} (用户主目录)"
+    echo ""
+
+    # 选择 GitHub 代理
+    echo -e "${CYAN}请选择下载代理:${RESET}"
+    echo -e "  ${GREEN}[1]${RESET} ghfast.top 镜像 (推荐)"
+    echo -e "  ${GREEN}[2]${RESET} gh.llkk.cc 镜像"
+    echo -e "  ${GREEN}[3]${RESET} 不使用代理（直连）"
+    echo -e "  ${GREEN}[4]${RESET} 自定义代理"
+    echo ""
+    echo -ne "${BOLD}${YELLOW}请选择 [1-4]: ${RESET}"
+    read -r proxy_choice
+    local proxy=""
+    case $proxy_choice in
+        1) proxy="https://ghfast.top/" ;;
+        2) proxy="https://gh.llkk.cc/" ;;
+        3) proxy="" ;;
+        4)
+            read -r -p "请输入自定义代理 URL (以 / 结尾): " proxy
+            [[ -n "$proxy" && "$proxy" != */ ]] && proxy="${proxy}/"
+            ;;
+        *) proxy="https://ghfast.top/" ;;
+    esac
+
+    echo ""
+    echo -e "${BOLD}${YELLOW}确认安装 NapCatQQ？(Y/n): ${RESET}"
+    read -r confirm
+    case "${confirm:-y}" in
+        y|Y|yes|YES) info "继续安装..." ;;
+        *) info "已取消安装"; return ;;
+    esac
+
+    # 下载安装脚本
+    local installer_url
+    local installer_file="$HOME/napcat-install.sh"
+
+    if [ -n "$proxy" ]; then
+        installer_url="${proxy}https://raw.githubusercontent.com/NapNeko/NapCat-Installer/main/script/install.sh"
+    else
+        installer_url="$NAPCAT_INSTALLER_URL"
+    fi
+
+    info "下载 NapCat 安装脚本..."
+    info "URL: $installer_url"
+    echo ""
+
+    if command -v curl &>/dev/null; then
+        if curl -L --progress-bar -o "$installer_file" "$installer_url"; then
+            success "脚本下载完成"
+        else
+            error "下载失败，请检查网络或更换代理后重试"
+            return 1
+        fi
+    elif command -v wget &>/dev/null; then
+        if wget --show-progress -O "$installer_file" "$installer_url"; then
+            success "脚本下载完成"
+        else
+            error "下载失败，请检查网络或更换代理后重试"
+            return 1
+        fi
+    else
+        error "curl 和 wget 均不可用，无法下载"
+        return 1
+    fi
+
+    # 运行安装脚本
+    echo ""
+    info "运行 NapCat 官方安装脚本..."
+    echo ""
+    print_line
+
+    chmod +x "$installer_file"
+    if bash "$installer_file"; then
+        success "NapCatQQ 安装完成"
+    else
+        warn "安装脚本退出（可能已手动完成或取消）"
+    fi
+
+    # 清理安装脚本
+    rm -f "$installer_file"
+
+    echo ""
+    print_line
+    echo -e "${BOLD}安装后配置步骤:${NC}"
+    echo -e "  ${GREEN}1${NC} 终端输入 ${CYAN}napcat${NC} 启动管理面板"
+    echo -e "  ${GREEN}2${NC} 浏览器访问 ${CYAN}http://localhost:6099/webui${NC}"
+    echo -e "  ${GREEN}3${NC} 默认 Token: ${CYAN}napcat${NC}"
+    echo -e "  ${GREEN}4${NC} 扫码登录 QQ（建议使用小号）"
+    echo -e "  ${GREEN}5${NC} 配置 WebSocket 连接到 MaiBot"
+    print_line
+    echo ""
+    read -r -p "按回车返回菜单..."
+}
+
+# =============================================
 # 主菜单
 # =============================================
 show_menu() {
@@ -802,10 +1030,12 @@ show_menu() {
     echo -e "  ${GREEN}8${NC}  📊 日志文件信息"
     echo -e "  ${GREEN}c${NC}  🧹 清理日志"
     echo ""
+    echo -e "  ${GREEN}n${NC}  🐱 安装 NapCatQQ"
+    echo ""
     echo -e "  ${GREEN}0${NC}  ❌ 退出"
     echo ""
 
-    echo -ne "${BOLD}请选择 [0-8/c]: ${NC}"
+    echo -ne "${BOLD}请选择 [0-8/c/n]: ${NC}"
 }
 
 # =============================================
@@ -824,6 +1054,7 @@ while true; do
         7) update_and_restart ;;
         8) check_log_size ;;
         c|C) clean_logs ;;
+        n|N) install_napcat ;;
         0)
             _NEED_PAUSE=0
             echo -e "${GREEN}再见!${NC}"
